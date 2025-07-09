@@ -1,0 +1,154 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+// OpenZeppelin
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+// Uniswap V3
+import "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
+
+// Chainlink
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "@chainlink/contracts/src/v0.8/AutomationCompatible.sol";
+
+contract GridBot is Ownable, AutomationCompatibleInterface {
+    // Constants
+    uint256 public constant GRID_TRIGGER_BPS = 50; // 0.5%
+    uint256 public constant PROFIT_SEND_BPS = 2000; // 20%
+    uint256 public constant MAX_SLIPPAGE_BPS = 100; // 1%
+    uint24 public constant UNISWAP_POOL_FEE = 3000; // 0.3%
+
+    // Tokens and Interfaces
+    address public immutable tokenA; // e.g., USDC
+    address public immutable tokenB; // e.g., WBTC
+    ISwapRouter public immutable swapRouter;
+    AggregatorV3Interface public immutable priceFeed;
+
+    // State
+    bool public initialized;
+    uint256 public lastPrice; // 8 decimals
+    uint256 public startValueTokenA;
+    uint256 public lastProfitCheckpoint;
+
+    constructor(
+        address _tokenA,
+        address _tokenB,
+        address _swapRouter,
+        address _priceFeed
+    ) Ownable(msg.sender) {
+        require(_tokenA != address(0) && _tokenB != address(0), "Zero token");
+        require(_swapRouter != address(0), "Zero router");
+        require(_priceFeed != address(0), "Zero feed");
+
+        tokenA = _tokenA;
+        tokenB = _tokenB;
+        swapRouter = ISwapRouter(_swapRouter);
+        priceFeed = AggregatorV3Interface(_priceFeed);
+    }
+
+    receive() external payable {}
+
+    function start(uint256 amountTokenA) external payable onlyOwner {
+        require(!initialized, "Already initialized");
+        require(msg.value >= 0.001 ether, "Need min 0.001 ETH");
+        require(amountTokenA >= 10 * 1e6, "Min $10 USDC");
+
+        // Pull tokenA from owner
+        IERC20(tokenA).transferFrom(msg.sender, address(this), amountTokenA);
+
+        // Swap 50% to tokenB
+        uint256 half = amountTokenA / 2;
+        IERC20(tokenA).approve(address(swapRouter), half);
+        _swap(tokenA, tokenB, half);
+
+        lastPrice = getLatestPrice();
+        startValueTokenA = getTotalValueInTokenA();
+        lastProfitCheckpoint = startValueTokenA;
+        initialized = true;
+    }
+
+    function checkUpkeep(bytes calldata) external view override returns (bool upkeepNeeded, bytes memory) {
+        if (!initialized) return (false, "");
+        uint256 priceNow = getLatestPrice();
+        uint256 change = (priceNow > lastPrice)
+            ? ((priceNow - lastPrice) * 10000) / lastPrice
+            : ((lastPrice - priceNow) * 10000) / lastPrice;
+        upkeepNeeded = (change >= GRID_TRIGGER_BPS);
+    }
+
+    function performUpkeep(bytes calldata) external override {
+        require(initialized, "Not started");
+        uint256 priceNow = getLatestPrice();
+        uint256 change = (priceNow > lastPrice)
+            ? ((priceNow - lastPrice) * 10000) / lastPrice
+            : ((lastPrice - priceNow) * 10000) / lastPrice;
+
+        require(change >= GRID_TRIGGER_BPS, "No trigger");
+
+        if (priceNow > lastPrice) {
+            uint256 amt = IERC20(tokenB).balanceOf(address(this));
+            if (amt > 0) _swap(tokenB, tokenA, amt);
+        } else {
+            uint256 amt = IERC20(tokenA).balanceOf(address(this));
+            if (amt > 0) _swap(tokenA, tokenB, amt);
+        }
+
+        lastPrice = priceNow;
+        _checkProfit();
+    }
+
+    function _swap(address fromToken, address toToken, uint256 amountIn) internal {
+        require(amountIn > 0, "Zero input");
+
+        IERC20(fromToken).approve(address(swapRouter), amountIn);
+
+        ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
+            tokenIn: fromToken,
+            tokenOut: toToken,
+            fee: UNISWAP_POOL_FEE,
+            recipient: address(this),
+            deadline: block.timestamp + 120,
+            amountIn: amountIn,
+            amountOutMinimum: (amountIn * (10000 - MAX_SLIPPAGE_BPS)) / 10000,
+            sqrtPriceLimitX96: 0
+        });
+
+        swapRouter.exactInputSingle(params);
+    }
+
+    function _checkProfit() internal {
+        uint256 currentValue = getTotalValueInTokenA();
+        uint256 threshold = lastProfitCheckpoint + (lastProfitCheckpoint * PROFIT_SEND_BPS) / 10000;
+
+        if (currentValue >= threshold) {
+            uint256 profit = currentValue - startValueTokenA;
+            uint256 payout = profit > IERC20(tokenA).balanceOf(address(this))
+                ? IERC20(tokenA).balanceOf(address(this))
+                : profit;
+            if (payout > 0) {
+                IERC20(tokenA).transfer(owner(), payout);
+                lastProfitCheckpoint = currentValue;
+            }
+        }
+    }
+
+    function getTotalValueInTokenA() public view returns (uint256) {
+        uint256 balA = IERC20(tokenA).balanceOf(address(this));
+        uint256 balB = IERC20(tokenB).balanceOf(address(this));
+        uint256 price = getLatestPrice(); // 8 decimals
+        return balA + ((balB * price) / 1e8);
+    }
+
+    function getLatestPrice() public view returns (uint256) {
+        (, int256 answer,,,) = priceFeed.latestRoundData();
+        require(answer > 0, "Invalid price");
+        return uint256(answer);
+    }
+
+    function withdrawAll() external onlyOwner {
+        IERC20(tokenA).transfer(owner(), IERC20(tokenA).balanceOf(address(this)));
+        IERC20(tokenB).transfer(owner(), IERC20(tokenB).balanceOf(address(this)));
+        payable(owner()).transfer(address(this).balance);
+    }
+}
